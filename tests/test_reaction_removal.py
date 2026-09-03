@@ -224,17 +224,16 @@ class ReactionRemovalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([10, 20], [request.msg_id for request in fake_app.requests])
         self.assertNotIn('Removed reactions from 2 messages.', output.getvalue())
 
-    async def test_default_run_keeps_existing_message_deletion_path(self):
+    async def test_default_run_uses_message_path_not_reaction_path(self):
         self.cleaner.search_messages = AsyncMock(return_value=[SimpleNamespace(id=10)])
         self.cleaner.delete_messages = AsyncMock()
+        self.cleaner.run_reaction_removal = AsyncMock()
 
         with redirect_stdout(StringIO()):
             await self.cleaner.run()
 
-        self.cleaner.delete_messages.assert_awaited_once_with(
-            chat_id=self.chat.id,
-            message_ids=[10],
-        )
+        self.cleaner.search_messages.assert_awaited()
+        self.cleaner.run_reaction_removal.assert_not_awaited()
 
 
 class ReactionArgumentTests(unittest.TestCase):
