@@ -34,6 +34,8 @@ if not os.path.exists(cachePath):
 
 
 class Cleaner:
+    reaction_batch_size = 100
+
     def __init__(self, chats=None, search_chunk_size=100, delete_chunk_size=100):
         self.chats = chats or []
         self.search_chunk_size = search_chunk_size
@@ -252,38 +254,93 @@ class Cleaner:
     def _chosen_reaction_kind(reaction):
         if reaction.chosen_order is None:
             return None
-        if getattr(reaction.type, 'type', None) == 'paid':
+        if isinstance(reaction.reaction, raw.types.ReactionPaid):
             return 'paid'
         return 'removable'
+
+    async def _invoke_with_flood_wait(self, request, action):
+        while True:
+            try:
+                return await app.invoke(request)
+            except FloodWait as flood_exception:
+                print(
+                    f'Flood limit reached while {action}, waiting '
+                    f'{flood_exception.value} seconds...'
+                )
+                await sleep(flood_exception.value)
+
+    async def get_full_reactions(self, peer, message_ids):
+        response = await self._invoke_with_flood_wait(
+            raw.functions.messages.GetMessagesReactions(
+                peer=peer,
+                id=message_ids,
+            ),
+            'checking reactions',
+        )
+        return {
+            update.msg_id: update.reactions
+            for update in getattr(response, 'updates', [])
+            if isinstance(update, raw.types.UpdateMessageReactions)
+        }
+
+    async def classify_reaction_batch(self, peer, message_ids):
+        removable_message_ids = []
+        paid_message_count = 0
+        full_reactions = await self.get_full_reactions(peer, message_ids)
+
+        for message_id in message_ids:
+            summary = full_reactions.get(message_id)
+            chosen_kinds = {
+                kind
+                for reaction in getattr(summary, 'results', [])
+                if (kind := self._chosen_reaction_kind(reaction)) is not None
+            }
+
+            if 'removable' in chosen_kinds:
+                removable_message_ids.append(message_id)
+            if 'paid' in chosen_kinds:
+                paid_message_count += 1
+
+        return removable_message_ids, paid_message_count
 
     async def search_reactions(self, chat_id):
         message_ids = []
         paid_message_count = 0
         scanned_count = 0
+        candidate_batch = []
+        peer = None
 
         async for message in app.get_chat_history(chat_id):
             scanned_count += 1
-            summary = getattr(message, 'reactions', None)
-            reactions = getattr(summary, 'reactions', None) or []
-            chosen_kinds = {
-                kind
-                for reaction in reactions
-                if (kind := self._chosen_reaction_kind(reaction)) is not None
-            }
+            if message.reactions:
+                candidate_batch.append(message.id)
 
-            if 'removable' in chosen_kinds:
-                message_ids.append(message.id)
-            if 'paid' in chosen_kinds:
-                paid_message_count += 1
+            if len(candidate_batch) == self.reaction_batch_size:
+                if peer is None:
+                    peer = await app.resolve_peer(chat_id)
+                removable, paid = await self.classify_reaction_batch(
+                    peer,
+                    candidate_batch,
+                )
+                message_ids.extend(removable)
+                paid_message_count += paid
+                candidate_batch = []
 
             if scanned_count % 1000 == 0:
                 print(f'Scanned {scanned_count} messages...')
+
+        if candidate_batch:
+            if peer is None:
+                peer = await app.resolve_peer(chat_id)
+            removable, paid = await self.classify_reaction_batch(peer, candidate_batch)
+            message_ids.extend(removable)
+            paid_message_count += paid
 
         print(
             f'Scanned {scanned_count} messages and found '
             f'{len(message_ids)} messages with removable reactions.'
         )
-        return message_ids, paid_message_count
+        return message_ids, paid_message_count, peer
 
     async def run_reaction_removal(self):
         reaction_plan = []
@@ -291,18 +348,18 @@ class Cleaner:
 
         for chat in self.chats:
             print(f'Searching for your reactions in "{chat.title}"...')
-            message_ids, paid_message_count = await self.search_reactions(chat.id)
-            reaction_plan.append((chat, message_ids))
+            message_ids, paid_message_count, peer = await self.search_reactions(chat.id)
+            reaction_plan.append((chat, peer, message_ids))
             total_paid_messages += paid_message_count
 
         print('\nReaction removal preview:')
-        for chat, message_ids in reaction_plan:
+        for chat, _, message_ids in reaction_plan:
             print(
                 f'  "{chat.title}" (chat ID: {chat.id}): '
                 f'{len(message_ids)} messages with removable reactions'
             )
 
-        total_messages = sum(len(message_ids) for _, message_ids in reaction_plan)
+        total_messages = sum(len(message_ids) for _, _, message_ids in reaction_plan)
         if total_paid_messages:
             print(
                 f'  {total_paid_messages} messages also contain paid reactions, '
@@ -326,32 +383,22 @@ class Cleaner:
             print('Confirmation did not match. Aborting without removing reactions.')
             return
 
-        for chat, message_ids in reaction_plan:
-            await self.remove_reactions(chat.id, message_ids)
+        for _, peer, message_ids in reaction_plan:
+            await self.remove_reactions(peer, message_ids)
 
-    async def remove_reactions(self, chat_id, message_ids):
+    async def remove_reactions(self, peer, message_ids):
         if not message_ids:
             return
 
-        peer = await app.resolve_peer(chat_id)
         for message_id in message_ids:
-            while True:
-                try:
-                    await app.invoke(
-                        raw.functions.messages.SendReaction(
-                            peer=peer,
-                            msg_id=message_id,
-                            reaction=None,
-                        )
-                    )
-                except FloodWait as flood_exception:
-                    print(
-                        'Flood limit reached while removing reactions, waiting '
-                        f'{flood_exception.value} seconds...'
-                    )
-                    await sleep(flood_exception.value)
-                else:
-                    break
+            await self._invoke_with_flood_wait(
+                raw.functions.messages.SendReaction(
+                    peer=peer,
+                    msg_id=message_id,
+                    reaction=None,
+                ),
+                'removing reactions',
+            )
 
         print(f'Removed reactions from {len(message_ids)} messages.')
 
