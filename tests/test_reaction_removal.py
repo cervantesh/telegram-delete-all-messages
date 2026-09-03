@@ -9,6 +9,8 @@ from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, mock_open, patch
 
+from pyrogram import raw, types
+
 os.environ.setdefault('API_ID', '12345')
 os.environ.setdefault('API_HASH', 'test-api-hash')
 
@@ -50,7 +52,7 @@ class FakeApp:
 
     async def resolve_peer(self, chat_id):
         self.resolved.append(chat_id)
-        return SimpleNamespace(write=lambda: b'peer')
+        return raw.types.InputPeerSelf()
 
     async def invoke(self, request):
         self.requests.append(request)
@@ -129,8 +131,31 @@ class ReactionRemovalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([self.chat.id], fake_app.resolved)
         self.assertEqual([10, 50], [request.msg_id for request in fake_app.requests])
         self.assertTrue(all(request.reaction is None for request in fake_app.requests))
+        serialized_flags = int.from_bytes(fake_app.requests[0].write()[4:8], 'little')
+        self.assertEqual(0, serialized_flags & 1)
         self.assertIn('2 messages with removable reactions', output.getvalue())
         self.assertIn('2 messages also contain paid reactions', output.getvalue())
+
+    async def test_pinned_client_parser_preserves_chosen_order_zero(self):
+        raw_summary = raw.types.MessageReactions(
+            results=[
+                raw.types.ReactionCount(
+                    reaction=raw.types.ReactionEmoji(emoticon='👍'),
+                    count=1,
+                    chosen_order=0,
+                )
+            ]
+        )
+        parsed_summary = types.MessageReactions._parse(None, raw_summary)
+        fake_app = FakeApp({
+            self.chat.id: [SimpleNamespace(id=10, reactions=parsed_summary)],
+        })
+
+        with patch.object(cleaner_module, 'app', fake_app), redirect_stdout(StringIO()):
+            message_ids, paid_count = await self.cleaner.search_reactions(self.chat.id)
+
+        self.assertEqual([10], message_ids)
+        self.assertEqual(0, paid_count)
 
     async def test_empty_inventory_does_not_prompt_or_resolve_peer(self):
         fake_app = FakeApp({
