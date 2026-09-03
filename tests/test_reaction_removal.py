@@ -25,23 +25,43 @@ from cleaner import Cleaner, parse_args
 
 
 def reaction(*, chosen_order=None, kind='emoji'):
-    return SimpleNamespace(
+    reaction_type = (
+        raw.types.ReactionPaid()
+        if kind == 'paid'
+        else raw.types.ReactionEmoji(emoticon='👍')
+    )
+    return raw.types.ReactionCount(
+        reaction=reaction_type,
+        count=1,
         chosen_order=chosen_order,
-        type=SimpleNamespace(type=kind),
     )
 
 
-def message(message_id, *reactions):
-    summary = SimpleNamespace(reactions=list(reactions)) if reactions else None
+def reaction_summary(*reactions, is_min=False):
+    return raw.types.MessageReactions(results=list(reactions), min=is_min)
+
+
+def message(message_id, has_reactions=True, summary=None):
+    if summary is None and has_reactions:
+        summary = SimpleNamespace(reactions=[])
     return SimpleNamespace(id=message_id, reactions=summary)
 
 
 class FakeApp:
-    def __init__(self, histories, invoke_effects=None):
+    def __init__(
+        self,
+        histories,
+        full_reactions=None,
+        hydration_effects=None,
+        mutation_effects=None,
+    ):
         self.histories = histories
-        self.invoke_effects = list(invoke_effects or [])
+        self.full_reactions = full_reactions or {}
+        self.hydration_effects = list(hydration_effects or [])
+        self.mutation_effects = list(mutation_effects or [])
         self.resolved = []
-        self.requests = []
+        self.hydration_requests = []
+        self.mutation_requests = []
 
     def get_chat_history(self, chat_id):
         async def history():
@@ -55,9 +75,26 @@ class FakeApp:
         return raw.types.InputPeerSelf()
 
     async def invoke(self, request):
-        self.requests.append(request)
-        if self.invoke_effects:
-            effect = self.invoke_effects.pop(0)
+        if isinstance(request, raw.functions.messages.GetMessagesReactions):
+            self.hydration_requests.append(request)
+            if self.hydration_effects:
+                effect = self.hydration_effects.pop(0)
+                if isinstance(effect, BaseException):
+                    raise effect
+            updates = [
+                raw.types.UpdateMessageReactions(
+                    peer=raw.types.PeerUser(user_id=1),
+                    msg_id=message_id,
+                    reactions=self.full_reactions[message_id],
+                )
+                for message_id in request.id
+                if message_id in self.full_reactions
+            ]
+            return SimpleNamespace(updates=updates)
+
+        self.mutation_requests.append(request)
+        if self.mutation_effects:
+            effect = self.mutation_effects.pop(0)
             if isinstance(effect, BaseException):
                 raise effect
         return True
@@ -79,7 +116,10 @@ class ReactionRemovalTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('Delete all your messages in', output.getvalue())
 
     async def test_wrong_confirmation_makes_no_mutation_calls(self):
-        fake_app = FakeApp({self.chat.id: [message(10, reaction(chosen_order=0))]})
+        fake_app = FakeApp(
+            {self.chat.id: [message(10)]},
+            {10: reaction_summary(reaction(chosen_order=0))},
+        )
         output = StringIO()
 
         with (
@@ -89,12 +129,16 @@ class ReactionRemovalTests(unittest.IsolatedAsyncioTestCase):
         ):
             await self.cleaner.run(remove_reactions=True)
 
-        self.assertEqual([], fake_app.requests)
+        self.assertEqual([], fake_app.mutation_requests)
+        self.assertEqual([[10]], [request.id for request in fake_app.hydration_requests])
         self.assertIn('Reaction removal preview:', output.getvalue())
         self.assertIn('Confirmation did not match', output.getvalue())
 
     async def test_eof_makes_no_mutation_calls(self):
-        fake_app = FakeApp({self.chat.id: [message(10, reaction(chosen_order=0))]})
+        fake_app = FakeApp(
+            {self.chat.id: [message(10)]},
+            {10: reaction_summary(reaction(chosen_order=0))},
+        )
 
         with (
             patch.object(cleaner_module, 'app', fake_app),
@@ -103,22 +147,29 @@ class ReactionRemovalTests(unittest.IsolatedAsyncioTestCase):
         ):
             await self.cleaner.run(remove_reactions=True)
 
-        self.assertEqual([], fake_app.requests)
+        self.assertEqual([], fake_app.mutation_requests)
 
     async def test_exact_confirmation_retracts_only_own_non_paid_reactions(self):
-        fake_app = FakeApp({
-            self.chat.id: [
-                message(10, reaction(chosen_order=0)),
-                message(20, reaction(chosen_order=None)),
-                message(30, reaction(chosen_order=1, kind='paid')),
-                message(40),
-                message(
-                    50,
+        fake_app = FakeApp(
+            {
+                self.chat.id: [
+                    message(10),
+                    message(20),
+                    message(30),
+                    message(40, has_reactions=False),
+                    message(50),
+                ]
+            },
+            {
+                10: reaction_summary(reaction(chosen_order=0)),
+                20: reaction_summary(reaction(chosen_order=None)),
+                30: reaction_summary(reaction(chosen_order=1, kind='paid')),
+                50: reaction_summary(
                     reaction(chosen_order=2, kind='paid'),
                     reaction(chosen_order=1),
                 ),
-            ]
-        })
+            },
+        )
         output = StringIO()
 
         with (
@@ -129,41 +180,98 @@ class ReactionRemovalTests(unittest.IsolatedAsyncioTestCase):
             await self.cleaner.run(remove_reactions=True)
 
         self.assertEqual([self.chat.id], fake_app.resolved)
-        self.assertEqual([10, 50], [request.msg_id for request in fake_app.requests])
-        self.assertTrue(all(request.reaction is None for request in fake_app.requests))
-        serialized_flags = int.from_bytes(fake_app.requests[0].write()[4:8], 'little')
+        self.assertEqual(
+            [[10, 20, 30, 50]],
+            [request.id for request in fake_app.hydration_requests],
+        )
+        self.assertEqual(
+            [10, 50],
+            [request.msg_id for request in fake_app.mutation_requests],
+        )
+        self.assertTrue(
+            all(request.reaction is None for request in fake_app.mutation_requests)
+        )
+        serialized_flags = int.from_bytes(
+            fake_app.mutation_requests[0].write()[4:8],
+            'little',
+        )
         self.assertEqual(0, serialized_flags & 1)
         self.assertIn('2 messages with removable reactions', output.getvalue())
         self.assertIn('2 messages also contain paid reactions', output.getvalue())
 
-    async def test_pinned_client_parser_preserves_chosen_order_zero(self):
-        raw_summary = raw.types.MessageReactions(
+    async def test_min_history_summary_is_hydrated_before_classification(self):
+        raw_min_summary = raw.types.MessageReactions(
             results=[
                 raw.types.ReactionCount(
                     reaction=raw.types.ReactionEmoji(emoticon='👍'),
                     count=1,
-                    chosen_order=0,
+                    chosen_order=None,
                 )
-            ]
+            ],
+            min=True,
         )
-        parsed_summary = types.MessageReactions._parse(None, raw_summary)
-        fake_app = FakeApp({
-            self.chat.id: [SimpleNamespace(id=10, reactions=parsed_summary)],
-        })
+        parsed_min_summary = types.MessageReactions._parse(None, raw_min_summary)
+        fake_app = FakeApp(
+            {self.chat.id: [message(10, summary=parsed_min_summary)]},
+            {10: reaction_summary(reaction(chosen_order=0))},
+        )
 
         with patch.object(cleaner_module, 'app', fake_app), redirect_stdout(StringIO()):
-            message_ids, paid_count = await self.cleaner.search_reactions(self.chat.id)
+            message_ids, paid_count, _ = await self.cleaner.search_reactions(self.chat.id)
 
         self.assertEqual([10], message_ids)
         self.assertEqual(0, paid_count)
 
-    async def test_empty_inventory_does_not_prompt_or_resolve_peer(self):
-        fake_app = FakeApp({
-            self.chat.id: [
-                message(10, reaction(chosen_order=None)),
-                message(20, reaction(chosen_order=0, kind='paid')),
-            ]
-        })
+    async def test_reaction_hydration_is_bounded_and_missing_updates_are_skipped(self):
+        self.cleaner.reaction_batch_size = 2
+        fake_app = FakeApp(
+            {self.chat.id: [message(10), message(20), message(30)]},
+            {
+                10: reaction_summary(reaction(chosen_order=0)),
+                30: reaction_summary(reaction(chosen_order=1)),
+            },
+        )
+
+        with patch.object(cleaner_module, 'app', fake_app), redirect_stdout(StringIO()):
+            message_ids, paid_count, _ = await self.cleaner.search_reactions(self.chat.id)
+
+        self.assertEqual([[10, 20], [30]], [r.id for r in fake_app.hydration_requests])
+        self.assertEqual([10, 30], message_ids)
+        self.assertEqual(0, paid_count)
+
+    async def test_hydration_failure_in_later_chat_prevents_all_mutations(self):
+        second_chat = SimpleNamespace(id=-100456, title='Broken group')
+        fake_app = FakeApp(
+            {
+                self.chat.id: [message(10)],
+                second_chat.id: [message(20)],
+            },
+            {
+                10: reaction_summary(reaction(chosen_order=0)),
+                20: reaction_summary(reaction(chosen_order=1)),
+            },
+            hydration_effects=[True, RuntimeError('hydration failed')],
+        )
+        cleaner = Cleaner(chats=[self.chat, second_chat])
+
+        with (
+            patch.object(cleaner_module, 'app', fake_app),
+            patch('builtins.input', side_effect=AssertionError('must not prompt')),
+            redirect_stdout(StringIO()),
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'hydration failed'):
+                await cleaner.run(remove_reactions=True)
+
+        self.assertEqual([], fake_app.mutation_requests)
+
+    async def test_no_removable_reactions_does_not_prompt_or_mutate(self):
+        fake_app = FakeApp(
+            {self.chat.id: [message(10), message(20)]},
+            {
+                10: reaction_summary(reaction(chosen_order=None)),
+                20: reaction_summary(reaction(chosen_order=0, kind='paid')),
+            },
+        )
 
         with (
             patch.object(cleaner_module, 'app', fake_app),
@@ -172,18 +280,19 @@ class ReactionRemovalTests(unittest.IsolatedAsyncioTestCase):
         ):
             await self.cleaner.run(remove_reactions=True)
 
-        self.assertEqual([], fake_app.resolved)
-        self.assertEqual([], fake_app.requests)
+        self.assertEqual([self.chat.id], fake_app.resolved)
+        self.assertEqual([], fake_app.mutation_requests)
 
-    async def test_flood_wait_retries_the_same_message(self):
+    async def test_mutation_flood_wait_retries_the_same_message(self):
         class FakeFloodWait(Exception):
             def __init__(self, value):
                 super().__init__(value)
                 self.value = value
 
         fake_app = FakeApp(
-            {self.chat.id: [message(10, reaction(chosen_order=0))]},
-            invoke_effects=[FakeFloodWait(0), True],
+            {self.chat.id: [message(10)]},
+            {10: reaction_summary(reaction(chosen_order=0))},
+            mutation_effects=[FakeFloodWait(0), True],
         )
 
         with (
@@ -195,7 +304,35 @@ class ReactionRemovalTests(unittest.IsolatedAsyncioTestCase):
         ):
             await self.cleaner.run(remove_reactions=True)
 
-        self.assertEqual([10, 10], [request.msg_id for request in fake_app.requests])
+        self.assertEqual(
+            [10, 10],
+            [request.msg_id for request in fake_app.mutation_requests],
+        )
+        mocked_sleep.assert_awaited_once_with(0)
+
+    async def test_hydration_flood_wait_retries_the_same_batch(self):
+        class FakeFloodWait(Exception):
+            def __init__(self, value):
+                super().__init__(value)
+                self.value = value
+
+        fake_app = FakeApp(
+            {self.chat.id: [message(10)]},
+            {10: reaction_summary(reaction(chosen_order=0))},
+            hydration_effects=[FakeFloodWait(0), True],
+        )
+
+        with (
+            patch.object(cleaner_module, 'app', fake_app),
+            patch.object(cleaner_module, 'FloodWait', FakeFloodWait),
+            patch.object(cleaner_module, 'sleep', new_callable=AsyncMock) as mocked_sleep,
+            patch('builtins.input', return_value='no'),
+            redirect_stdout(StringIO()),
+        ):
+            await self.cleaner.run(remove_reactions=True)
+
+        self.assertEqual([[10], [10]], [request.id for request in fake_app.hydration_requests])
+        self.assertEqual([], fake_app.mutation_requests)
         mocked_sleep.assert_awaited_once_with(0)
 
     async def test_inventory_failure_happens_before_any_mutation(self):
@@ -211,9 +348,10 @@ class ReactionRemovalTests(unittest.IsolatedAsyncioTestCase):
                     return failing_history()
                 return super().get_chat_history(chat_id)
 
-        fake_app = FailingInventoryApp({
-            self.chat.id: [message(10, reaction(chosen_order=0))],
-        })
+        fake_app = FailingInventoryApp(
+            {self.chat.id: [message(10)]},
+            {10: reaction_summary(reaction(chosen_order=0))},
+        )
         cleaner = Cleaner(chats=[self.chat, second_chat])
 
         with (
@@ -224,17 +362,21 @@ class ReactionRemovalTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, 'history unavailable'):
                 await cleaner.run(remove_reactions=True)
 
-        self.assertEqual([], fake_app.requests)
+        self.assertEqual([], fake_app.mutation_requests)
 
     async def test_mutation_failure_is_not_reported_as_complete(self):
         fake_app = FakeApp(
             {
                 self.chat.id: [
-                    message(10, reaction(chosen_order=0)),
-                    message(20, reaction(chosen_order=1)),
+                    message(10),
+                    message(20),
                 ]
             },
-            invoke_effects=[True, RuntimeError('request failed')],
+            {
+                10: reaction_summary(reaction(chosen_order=0)),
+                20: reaction_summary(reaction(chosen_order=1)),
+            },
+            mutation_effects=[True, RuntimeError('request failed')],
         )
         output = StringIO()
 
@@ -246,7 +388,10 @@ class ReactionRemovalTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, 'request failed'):
                 await self.cleaner.run(remove_reactions=True)
 
-        self.assertEqual([10, 20], [request.msg_id for request in fake_app.requests])
+        self.assertEqual(
+            [10, 20],
+            [request.msg_id for request in fake_app.mutation_requests],
+        )
         self.assertNotIn('Removed reactions from 2 messages.', output.getvalue())
 
     async def test_default_run_uses_message_path_not_reaction_path(self):
