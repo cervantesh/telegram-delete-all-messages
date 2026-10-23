@@ -4,7 +4,9 @@ import json
 from asyncio import sleep
 
 from pyrogram import Client, enums, raw
-from pyrogram.errors import FloodWait, UnknownError
+from pyrogram.errors import (
+    AuthKeyInvalid, AuthKeyUnregistered, FloodWait, SessionExpired, SessionRevoked, UnknownError,
+)
 
 from qr_auth import login_with_qr
 
@@ -264,9 +266,29 @@ def select_login_method():
         print('Invalid option selected. Try again.')
 
 
+async def reset_session():
+    """Disconnect and delete the stored session so the next connect starts from scratch."""
+    await app.disconnect()
+    await app.storage.delete()
+    # The session is a SQLite database in WAL mode, drop its sidecar files as well.
+    for suffix in ('-wal', '-shm'):
+        sidecar = f'{app.storage.database}{suffix}'
+        if os.path.exists(sidecar):
+            os.remove(sidecar)
+
+
 async def ensure_logged_in():
-    """Connect the client, authorizing it first if there is no session yet."""
+    """Connect the client, authorizing it first if there is no valid session yet."""
     is_authorized = await app.connect()
+
+    if is_authorized:
+        try:
+            await app.invoke(raw.functions.updates.GetState())
+        except (AuthKeyUnregistered, AuthKeyInvalid, SessionExpired, SessionRevoked):
+            # The session was terminated from another device or expired on Telegram's side.
+            print('Saved session is no longer valid, please log in again.')
+            await reset_session()
+            is_authorized = await app.connect()
 
     if not is_authorized:
         if select_login_method() == '2':
